@@ -1,335 +1,236 @@
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from openai import OpenAI
+from openai import APIError, OpenAI, OpenAIError, RateLimitError
 
-from .prompts import SYSTEM_PROMPT
-from .tools import get_tools, handle_tool
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Simple OpenAI client initialization
 api_key = os.getenv("OPENAI_API_KEY")
-client = None
+if not api_key:
 
-if api_key:
+    logger.error("CRITICAL: OPENAI_API_KEY environment variable not found. Real LLM calls will fail.")
+
+    client = None
+else:
     client = OpenAI(api_key=api_key)
     logger.info("OpenAI client initialized with provided API key")
-else:
-    logger.warning("No OPENAI_API_KEY environment variable found. Using mock responses.")
 
-def validate_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Validate and clean messages to ensure they're in the correct format for OpenAI's API.
-    Specifically handles tool messages and tool_calls to prevent errors.
-    """
-    valid_messages = []
-    has_tool_call = False
-    tool_call_id = None
+def validate_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     
+    valid_messages = []
+    assistant_message_indices_with_tool_calls = set()
+
     for i, msg in enumerate(messages):
-        # Skip messages without role or content (unless it's a tool message with tool_call_id)
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            assistant_message_indices_with_tool_calls.add(i)
+
+    for i, msg in enumerate(messages):
+
         if "role" not in msg:
             logger.warning(f"Skipping message at index {i}: missing 'role'")
             continue
-            
-        # Handle tool messages specifically
+        if msg["role"] not in ["system", "user", "assistant", "tool"]:
+             logger.warning(f"Skipping message at index {i}: invalid 'role' {msg['role']}")
+             continue
+
         if msg["role"] == "tool":
-            # Tool messages must have a tool_call_id and follow a message with tool_calls
-            if not has_tool_call:
-                logger.warning(f"Skipping tool message at index {i}: no preceding message with tool_calls")
-                continue
-                
-            # Ensure tool messages have tool_call_id
+
             if "tool_call_id" not in msg:
                 logger.warning(f"Skipping tool message at index {i}: missing 'tool_call_id'")
                 continue
-                
-            # Add the tool message
+
+            preceded_by_assistant_tool_call = False
+            for assistant_idx in assistant_message_indices_with_tool_calls:
+                if assistant_idx < i:
+                    preceded_by_assistant_tool_call = True
+                    break
+            if not preceded_by_assistant_tool_call:
+                 logger.warning(f"Skipping tool message at index {i}: does not follow an assistant message with tool_calls in the current history slice.")
+                 continue
+
             valid_msg = {
                 "role": "tool",
                 "tool_call_id": msg["tool_call_id"],
-                "content": msg.get("content", "")
+                "content": str(msg.get("content", ""))
             }
             valid_messages.append(valid_msg)
-            continue
-            
-        # All non-tool messages must have content
-        if "content" not in msg and msg["role"] != "assistant":
-            logger.warning(f"Skipping message at index {i}: missing 'content'")
-            continue
-            
-        # Create a copy of the message with only the fields OpenAI expects
-        valid_msg = {"role": msg["role"]}
-        
-        # Include content if present (can be None for assistant messages with tool_calls)
-        if "content" in msg:
-            valid_msg["content"] = msg["content"]
+
         elif msg["role"] == "assistant":
-            valid_msg["content"] = ""  # Empty string for missing content
-            
-        # Add tool_calls for assistant messages if present
-        if msg["role"] == "assistant" and "tool_calls" in msg and msg["tool_calls"]:
-            valid_msg["tool_calls"] = msg["tool_calls"]
-            has_tool_call = True
-        else:
-            has_tool_call = False
-            
-        valid_messages.append(valid_msg)
-    
+            valid_msg = {"role": "assistant"}
+
+            if "content" in msg and msg["content"] is not None:
+                 valid_msg["content"] = str(msg["content"])
+            elif "tool_calls" not in msg or not msg["tool_calls"]:
+                 valid_msg["content"] = ""
+
+            if "tool_calls" in msg and msg["tool_calls"]:
+                if not isinstance(msg["tool_calls"], list):
+                     logger.warning(f"Skipping assistant message at index {i}: 'tool_calls' is not a list.")
+                     continue
+                valid_tool_calls = []
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict) and "id" in tc and "type" in tc and "function" in tc:
+                        if isinstance(tc["function"], dict) and "name" in tc["function"] and "arguments" in tc["function"]:
+                             valid_tool_calls.append(tc)
+
+                if not valid_tool_calls:
+
+                    if "content" not in valid_msg:
+                         valid_msg["content"] = ""
+                else:
+                     valid_msg["tool_calls"] = valid_tool_calls
+
+            if "content" in valid_msg or "tool_calls" in valid_msg:
+                valid_messages.append(valid_msg)
+            else:
+                logger.warning(f"Skipping assistant message at index {i}: No content or valid tool_calls.")
+
+        elif msg["role"] in ["user", "system"]:
+            if "content" not in msg or msg["content"] is None:
+                logger.warning(f"Skipping {msg['role']} message at index {i}: missing 'content'")
+                continue
+            valid_msg = {
+                "role": msg["role"],
+                "content": str(msg["content"])
+            }
+            valid_messages.append(valid_msg)
+
+    if valid_messages and valid_messages[0]["role"] in ["assistant", "tool"]:
+         logger.warning("History starts with an assistant or tool message, which might be problematic.")
+
     logger.info(f"Validated messages: {len(valid_messages)} valid out of {len(messages)} input messages")
     return valid_messages
 
 def chat_completion(
-    messages: List[Dict[str, str]], 
-    tools: Optional[List[Dict[str, Any]]] = None,
-    stream: bool = False
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = "auto"
 ):
-    """Call OpenAI API to get chat completion"""
     model = "gpt-4o"
-    
-    if tools is None:
-        tools = get_tools()
-    
-    # Validate and clean the messages
+
+    if not client:
+        logger.error("OpenAI client not available. Cannot make API call.")
+        raise OpenAIError("OpenAI client is not configured. Check OPENAI_API_KEY.")
+
     validated_messages = validate_messages(messages)
-    
-    # If we have a valid client, use the OpenAI API
-    if client and api_key:
+
+    if not validated_messages:
+        logger.error("No valid messages to send to OpenAI API after validation.")
+        raise ValueError("Cannot call OpenAI API with an empty message list.")
+
+    try:
+        logger.info(f"Calling OpenAI API with {len(validated_messages)} messages. First role: {validated_messages[0]['role']}, Last role: {validated_messages[-1]['role']}")
+
+        last_msg = validated_messages[-1]
+        last_content_preview = str(last_msg.get('content'))[:100] + '...' if last_msg.get('content') else '[No content]'
+        if last_msg.get("tool_calls"):
+             last_content_preview += f" (Tool Calls: {len(last_msg['tool_calls'])})"
+        logger.info(f"Last message preview: {last_msg.get('role')}: {last_content_preview}")
+
+        api_params = {
+            "model": model,
+            "messages": validated_messages,
+        }
+        if tools:
+             api_params["tools"] = tools
+             api_params["tool_choice"] = tool_choice
+
+        response = client.chat.completions.create(**api_params)
+
+        finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
+        logger.info(f"OpenAI API response received successfully. Finish reason: {finish_reason}")
+
+        return response
+
+    except RateLimitError as e:
+        logger.error(f"OpenAI API rate limit exceeded: {e}")
+        raise OpenAIError(f"API Rate Limit Exceeded: {e.body.get('message', 'Please try again later.')}") from e
+    except APIError as e:
+        logger.error(f"OpenAI API returned an API Error: {e}")
+        raise OpenAIError(f"API Error: {e.body.get('message', 'An unexpected error occurred.')}") from e
+    except OpenAIError as e:
+        logger.error(f"OpenAI API request failed: {e}")
+
+        error_message = str(e)
         try:
-            logger.info(f"Calling OpenAI API with {len(validated_messages)} messages")
-            
-            # Log the last few messages for debugging (without system prompt)
-            if len(validated_messages) > 0:
-                logger.info(f"Last message: {validated_messages[-1].get('role')}: {validated_messages[-1].get('content')[:100] if validated_messages[-1].get('content') else '[No content]'}...")
-            
-            response = client.chat.completions.create(
-                model=model,
-                messages=validated_messages,
-                tools=tools,
-                stream=stream
-            )
-            
-            logger.info(f"OpenAI API response received with status: {response.choices[0].finish_reason}")
-            
-            return response
-        except Exception as e:
-            logger.error(f"Error calling OpenAI API: {e}")
-            # Fall back to mock response
-    
-    # Create a mock response for development without API key
-    logger.info("Using mock response for chat completion")
-    
-    # Get the last user message
-    last_message = "Hello"
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            last_message = msg.get("content", "")
-            break
-    
-    # Generate mock response based on user message
-    if "generate" in last_message.lower() and "sequence" in last_message.lower():
-        # Mock a tool call for sequence generation
-        mock_response = create_mock_completion_with_tool_call("generate_sequence", last_message)
-    elif "research" in last_message.lower() and "industry" in last_message.lower():
-        # Mock a tool call for industry research
-        mock_response = create_mock_completion_with_tool_call("research_industry", last_message)
-    elif any(keyword in last_message.lower() for keyword in ["sales sequence", "outreach", "homeowner", "fire", "aid", "program", "gov", "assistance", "support", "california", "LA", "los angeles", "california"]):
-        # More aggressive tool call triggering for sales/outreach scenarios
-        logger.info("Detected sales/outreach related keywords, triggering sequence generation")
-        mock_response = create_mock_completion_with_tool_call("generate_sequence", last_message)
-    else:
-        # Regular response
-        mock_response = create_mock_completion(
-            f"I'm Eunoia, your AI recruiting assistant. How can I help you create effective outreach sequences today? (Note: This is a mock response as no OpenAI API key was provided.)"
-        )
-    
-    return mock_response
 
-def create_mock_completion(content):
-    """Create a mock ChatCompletion object with a simple structure"""
-    # Create a simple dict-based mock that mimics the OpenAI response structure
-    message = {
-        "content": content,
-        "role": "assistant",
-        "function_call": None,
-        "tool_calls": None
-    }
-    
-    choice = {
-        "finish_reason": "stop",
-        "index": 0,
-        "message": message,
-        "logprobs": None
-    }
-    
-    # Convert to an object with attribute access for compatibility
-    class DictToObject:
-        def __init__(self, data):
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    setattr(self, key, DictToObject(value))
-                else:
-                    setattr(self, key, value)
-    
-    mock_completion = {
-        "id": "mock-completion-id",
-        "choices": [DictToObject(choice)],
-        "created": 1234567890,
-        "model": "mock-model",
-        "object": "chat.completion",
-        "system_fingerprint": None
-    }
-    
-    return DictToObject(mock_completion)
+             if hasattr(e, 'response') and e.response and e.response.content:
+                  response_data = json.loads(e.response.content.decode('utf-8'))
+                  error_message = response_data.get('error', {}).get('message', str(e))
+             elif hasattr(e, 'body') and e.body and 'message' in e.body:
+                  error_message = e.body['message']
+        except (json.JSONDecodeError, AttributeError, TypeError):
+             pass
+        raise OpenAIError(f"API Request Failed: {error_message}") from e
+    except Exception as e:
 
-def create_mock_completion_with_tool_call(tool_name, last_message=""):
-    """Create a mock ChatCompletion with a tool call"""
-    
-    # Parse important keywords from the last message
-    target_role = ""
-    company_name = "your company"
-    industry = ""
-    value_proposition = ""
-    
-    # Extract possible target role/audience
-    if "homeowner" in last_message.lower():
-        target_role = "Homeowners"
-    elif "developer" in last_message.lower():
-        target_role = "Software Developers"
-    elif "sales" in last_message.lower() and "sequence" in last_message.lower():
-        target_role = "Sales Prospects"
-    
-    # Extract possible industry information
-    if "tech" in last_message.lower() or "software" in last_message.lower():
-        industry = "Technology"
-    elif "real estate" in last_message.lower() or "home" in last_message.lower():
-        industry = "Real Estate"
-    elif "LA" in last_message or "california" in last_message.lower() or "los angeles" in last_message.lower():
-        industry = "Real Estate"
-        target_role = "Homeowners in LA"
-    
-    # Extract possible value proposition
-    if "fire" in last_message.lower() and ("support" in last_message.lower() or "aid" in last_message.lower()):
-        value_proposition = "provide emergency support after recent fires"
-    elif "gov" in last_message.lower() and "aid" in last_message.lower():
-        value_proposition = "access government aid programs"
-    elif "program" in last_message.lower():
-        value_proposition = "join our special assistance program"
-    
-    if tool_name == "generate_sequence":
-        # Use extracted info or defaults
-        args = json.dumps({
-            "company_name": company_name,
-            "target_role": target_role or "Potential Customers",
-            "industry": industry or "General",
-            "value_proposition": value_proposition or ""
-        })
-    elif tool_name == "research_industry":
-        args = json.dumps({
-            "industry": industry or "technology"
-        })
-    else:
-        args = json.dumps({})
-    
-    # Create tool call object
-    function_obj = {
-        "name": tool_name,
-        "arguments": args
-    }
-    
-    tool_call = {
-        "id": f"mock-{tool_name}-call",
-        "function": function_obj,
-        "type": "function"
-    }
-    
-    message = {
-        "content": "I'll help you with that.",
-        "role": "assistant",
-        "tool_calls": [tool_call]
-    }
-    
-    choice = {
-        "finish_reason": "tool_calls",
-        "index": 0,
-        "message": message,
-        "logprobs": None
-    }
-    
-    # Convert to an object with attribute access for compatibility
-    class DictToObject:
-        def __init__(self, data):
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    setattr(self, key, DictToObject(value))
-                elif isinstance(value, list):
-                    setattr(self, key, [DictToObject(item) if isinstance(item, dict) else item for item in value])
-                else:
-                    setattr(self, key, value)
-    
-    mock_completion = {
-        "id": "mock-completion-id-with-tool",
-        "choices": [DictToObject(choice)],
-        "created": 1234567890,
-        "model": "mock-model",
-        "object": "chat.completion",
-        "system_fingerprint": None
-    }
-    
-    return DictToObject(mock_completion)
+        logger.error(f"Unexpected error calling OpenAI API: {e}", exc_info=True)
+        raise OpenAIError(f"An unexpected error occurred while communicating with the AI model: {str(e)}") from e
 
 def handle_tool_calls(tool_calls):
-    """Process the tool calls from the model response"""
+    
     results = []
+
+    if not isinstance(tool_calls, list):
+        logger.error(f"Expected tool_calls to be a list, but got {type(tool_calls)}")
+        return results
+
     for tool_call in tool_calls:
         try:
+
+            if not hasattr(tool_call, 'function') or not hasattr(tool_call.function, 'name') or not hasattr(tool_call.function, 'arguments'):
+                 logger.error(f"Skipping invalid tool_call structure: {tool_call}")
+                 continue
+
             function_name = tool_call.function.name
             arguments_json = tool_call.function.arguments
-            
-            # Parse arguments
+
             try:
                 arguments = json.loads(arguments_json)
             except json.JSONDecodeError:
-                logger.error(f"Invalid JSON in tool call arguments: {arguments_json}")
-                arguments = {}
-            
-            # Call the appropriate tool handler
-            result = handle_tool(function_name, arguments)
-            
-            # Add metadata to result
+                logger.error(f"Invalid JSON in tool call arguments for {function_name}: {arguments_json}")
+
+                result_content = {"error": f"Invalid arguments format for {function_name}."}
+                arguments = None
+            except Exception as e:
+                 logger.error(f"Unexpected error parsing arguments for {function_name}: {e}")
+                 result_content = {"error": f"Error parsing arguments for {function_name}."}
+                 arguments = None
+
+            if arguments is not None:
+
+                 from .tools import handle_tool
+                 result_content = handle_tool(function_name, arguments)
+
             results.append({
-                "tool_call_id": tool_call.id,
+                "tool_call_id": getattr(tool_call, "id", "unknown"),
                 "function_name": function_name,
-                "result": result
+                "result": result_content
             })
-            
-            logger.info(f"Successfully executed tool {function_name}")
+
+            logger.info(f"Successfully prepared result for tool {function_name}")
+
         except Exception as e:
-            logger.error(f"Error processing tool call: {e}", exc_info=True)
+
+            logger.error(f"Error processing tool call {getattr(tool_call, 'function', {}).get('name', 'unknown')}: {e}", exc_info=True)
             results.append({
                 "tool_call_id": getattr(tool_call, "id", "unknown"),
                 "function_name": getattr(tool_call, "function", {}).get("name", "unknown"),
                 "result": {"error": f"Tool execution failed: {str(e)}"}
             })
-    
+
     return results
 
 def update_sequence(args):
-    """Update an existing sequence"""
+    
     sequence_id = args.get("sequence_id")
     changes = args.get("changes", [])
-    
-    # In a production environment, you would fetch the sequence from database
-    # For this implementation, we'll just echo back the changes as if applied
-    
+
     success_messages = []
-    
-    # If changes is a whole sequence object, just return it
+
     if isinstance(changes, dict) and "steps" in changes:
         return {
             "sequence_id": sequence_id,
@@ -337,14 +238,12 @@ def update_sequence(args):
             "message": "Sequence updated with all new content",
             "updated_sequence": changes
         }
-    
-    # Otherwise, process individual changes
+
     for change in changes:
         if isinstance(change, dict):
-            if "step_index" in change and "field" in change and "value" in change:
+            if "step_index" in change and "field" in change:
                 step_index = change.get("step_index")
                 field = change.get("field")
-                value = change.get("value")
                 success_messages.append(f"Updated step {step_index+1}, set {field} to new value")
             elif "add_step" in change and change["add_step"] is True:
                 new_step = change.get("step_data", {})
@@ -365,7 +264,7 @@ def update_sequence(args):
     }
 
 def research_industry(args):
-    """Research information about an industry"""
+    
     industry = args.get("industry", "").lower()
     
     industry_info = {
@@ -490,8 +389,7 @@ def research_industry(args):
             ]
         }
     }
-    
-    # Default information if industry not found
+
     default_info = {
         "overview": f"The {industry} industry has unique challenges and opportunities.",
         "trends": [

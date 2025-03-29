@@ -1,18 +1,205 @@
-import json
 import logging
-import random
-import uuid
 from datetime import datetime
+from typing import Any
 
-from flask import Blueprint, jsonify, request
+from fastapi import APIRouter, Request
+from flask import jsonify, request
 from sqlalchemy.orm import Session
 
 from api.db import SessionLocal, get_db
-from api.models import Sequence
+from api.models import Sequence, SequenceStep
+from api.websocket import emit_sequence_update
 
-sequence_routes = Blueprint("sequence", __name__)
+router = APIRouter()
 
-@sequence_routes.route("/api/sequences", methods=["GET"])
+def create_response(success: bool = True, data: Any = None, error: str = None):
+    response = {"success": success}
+    if data is not None:
+        response["data"] = data
+    if error is not None:
+        response["error"] = error
+    return response
+
+def sequence_schema(sequence):
+    if not sequence:
+        return None
+    
+    return {
+        "id": sequence.id,
+        "name": sequence.name,
+        "session_id": sequence.session_id,
+        "description": sequence.description,
+        "created_at": sequence.created_at.isoformat(),
+        "updated_at": sequence.updated_at.isoformat(),
+        "steps": [
+            {
+                "id": step.id,
+                "channel": step.channel,
+                "message": step.message,
+                "position": step.position
+            }
+            for step in sorted(sequence.steps, key=lambda x: x.position)
+        ]
+    }
+
+def validate_sequence_data(data: dict) -> tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, "Sequence data must be a dictionary"
+    
+    if "steps" not in data or not isinstance(data["steps"], list):
+        return False, "Sequence must contain a 'steps' field that is a list"
+    
+    for step in data["steps"]:
+        if not isinstance(step, dict):
+            return False, "Each step must be a dictionary"
+        if "message" not in step or not isinstance(step["message"], str):
+            return False, "Each step must have a 'message' field that is a string"
+        if "channel" not in step or not isinstance(step["channel"], str):
+            return False, "Each step must have a 'channel' field that is a string"
+    
+    return True, ""
+
+@router.get("/sequences/session")
+async def get_sequence_for_session(session_id: str, db: Session = None):
+    if db is None:
+        db = get_db()
+    
+    if not session_id:
+        return create_response(success=False, error="Missing session_id parameter")
+    
+    try:
+        sequence = db.query(Sequence).filter(Sequence.session_id == session_id).first()
+        
+        if not sequence:
+            return create_response(success=True, data={"sequence_data": None})
+        
+        sequence_data = sequence_schema(sequence)
+        return create_response(success=True, data={"sequence_data": sequence_data})
+    except Exception as e:
+        logging.error(f"Error retrieving sequence for session {session_id}: {str(e)}")
+        return create_response(success=False, error=f"Database error: {str(e)}")
+
+async def save_or_update_sequence(
+    request: Request,
+    db: Session = None
+):
+    if db is None:
+        db = get_db()
+        
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+        sequence_data = data.get("sequence")
+        
+        if not session_id:
+            return create_response(success=False, error="Missing session_id")
+        
+        if not sequence_data:
+            return create_response(success=False, error="Missing sequence data")
+        
+        is_valid, error_msg = validate_sequence_data(sequence_data)
+        if not is_valid:
+            return create_response(success=False, error=error_msg)
+        
+        existing_sequence = db.query(Sequence).filter(Sequence.session_id == session_id).first()
+        
+        if existing_sequence:
+            existing_sequence.name = sequence_data.get("name", "Untitled Sequence")
+            existing_sequence.description = sequence_data.get("description", "")
+            existing_sequence.updated_at = datetime.utcnow()
+            
+            db.query(SequenceStep).filter(SequenceStep.sequence_id == existing_sequence.id).delete()
+            
+            for i, step in enumerate(sequence_data["steps"]):
+                new_step = SequenceStep(
+                    sequence_id=existing_sequence.id,
+                    message=step["message"],
+                    channel=step["channel"],
+                    position=i
+                )
+                db.add(new_step)
+            
+            sequence_id = existing_sequence.id
+        else:
+            new_sequence = Sequence(
+                session_id=session_id,
+                name=sequence_data.get("name", "Untitled Sequence"),
+                description=sequence_data.get("description", "")
+            )
+            db.add(new_sequence)
+            db.flush()
+            
+            for i, step in enumerate(sequence_data["steps"]):
+                new_step = SequenceStep(
+                    sequence_id=new_sequence.id,
+                    message=step["message"],
+                    channel=step["channel"],
+                    position=i
+                )
+                db.add(new_step)
+            
+            sequence_id = new_sequence.id
+        
+        db.commit()
+        
+        request.app.sio.emit(
+            "sequence_update", 
+            sequence_data,
+            room=session_id
+        )
+        
+        return create_response(success=True, data={"sequence_id": sequence_id})
+    except Exception as e:
+        db.rollback()
+        logging.error(f"Error saving sequence: {str(e)}")
+        return create_response(success=False, error=f"Error saving sequence: {str(e)}")
+    finally:
+        db.close()
+
+async def reset_sequence(
+    request: Request,
+    db: Session = None
+):
+    if db is None:
+        db = get_db()
+        
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+        
+        if not session_id:
+            return create_response(success=False, error="Missing session_id")
+        
+        reset_success = await _reset_sequence_for_session(request, session_id, db)
+        
+        return create_response(success=True, data={"reset": reset_success})
+    except Exception as e:
+        db.rollback()
+        logging.error(f"Error resetting sequence: {str(e)}")
+        return create_response(success=False, error=f"Error resetting sequence: {str(e)}")
+    finally:
+        db.close()
+
+async def _reset_sequence_for_session(request: Request, session_id: str, db: Session) -> bool:
+    try:
+        request.app.sio.emit(
+            "sequence_update", 
+            None,
+            room=session_id
+        )
+        
+        sequence = db.query(Sequence).filter(Sequence.session_id == session_id).first()
+        if sequence:
+            db.delete(sequence)
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        db.rollback()
+        logging.error(f"Error in _reset_sequence_for_session: {str(e)}")
+        raise
+
+@router.route("/api/sequences", methods=["GET"])
 def get_sequences():
     user_id = request.args.get("user_id")
     session_id = request.args.get("session_id")
@@ -22,14 +209,12 @@ def get_sequences():
     
     if not user_id and not session_id:
         logger.warning("No user_id or session_id provided in request")
-        return jsonify({"error": "user_id or session_id is required"}), 400
+        return create_response(success=False, error="user_id or session_id is required")
     
     db = SessionLocal()
     try:
-        # Base query
         query = db.query(Sequence)
         
-        # Apply filters
         if user_id:
             query = query.filter(Sequence.user_id == user_id)
         if session_id:
@@ -38,7 +223,6 @@ def get_sequences():
         sequences = query.order_by(Sequence.created_at.desc()).all()
         logger.info(f"Found {len(sequences)} sequences for request")
         
-        # Convert to dictionary format for client
         sequence_data = [
             {
                 "id": seq.id,
@@ -52,14 +236,14 @@ def get_sequences():
             for seq in sequences
         ]
         
-        return jsonify(sequence_data)
+        return create_response(success=True, data=sequence_data)
     except Exception as e:
         logger.error(f"Error retrieving sequences: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Database error: {str(e)}"}), 500
+        return create_response(success=False, error=f"Database error: {str(e)}")
     finally:
         db.close()
 
-@sequence_routes.route("/api/sequences/<int:sequence_id>", methods=["GET"])
+@router.route("/api/sequences/<int:sequence_id>", methods=["GET"])
 def get_sequence(sequence_id):
     db = SessionLocal()
     try:
@@ -70,7 +254,6 @@ def get_sequence(sequence_id):
         if not sequence:
             return jsonify({"error": "Sequence not found"}), 404
         
-        # Convert to dictionary format for client
         sequence_data = {
             "id": sequence.id,
             "user_id": sequence.user_id,
@@ -87,22 +270,19 @@ def get_sequence(sequence_id):
     finally:
         db.close()
 
-@sequence_routes.route("/api/sequences", methods=["POST"])
+@router.route("/api/sequences", methods=["POST"])
 def create_sequence():
     data = request.json
     required_fields = ["user_id", "title", "target_role", "target_industry", "sequence_data"]
     
-    # Also handle session_id if provided
     session_id = data.get("session_id")
     
-    # Validate required fields
     for field in required_fields:
         if field not in data:
             return jsonify({"error": f"{field} is required"}), 400
     
     db = SessionLocal()
     try:
-        # Create new sequence in database
         new_sequence = Sequence(
             user_id=data["user_id"],
             session_id=session_id,
@@ -116,7 +296,6 @@ def create_sequence():
         db.commit()
         db.refresh(new_sequence)
         
-        # Convert to dictionary format for client
         sequence_data = {
             "id": new_sequence.id,
             "user_id": new_sequence.user_id,
@@ -132,7 +311,7 @@ def create_sequence():
     finally:
         db.close()
 
-@sequence_routes.route("/api/sequences/<int:sequence_id>", methods=["PUT"])
+@router.route("/api/sequences/<int:sequence_id>", methods=["PUT"])
 def update_sequence(sequence_id):
     data = request.json
     
@@ -145,7 +324,6 @@ def update_sequence(sequence_id):
         if not sequence:
             return jsonify({"error": "Sequence not found"}), 404
         
-        # Update fields
         if "title" in data:
             sequence.title = data["title"]
         if "target_role" in data:
@@ -167,7 +345,7 @@ def update_sequence(sequence_id):
     finally:
         db.close()
 
-@sequence_routes.route("/api/sequences/<int:sequence_id>", methods=["DELETE"])
+@router.route("/api/sequences/<int:sequence_id>", methods=["DELETE"])
 def delete_sequence(sequence_id):
     db = SessionLocal()
     try:
@@ -187,41 +365,78 @@ def delete_sequence(sequence_id):
     finally:
         db.close()
 
-@sequence_routes.route("/api/sequences/reset", methods=["POST"])
-def reset_sequence():
-    """Clear all sequence data for a session - typically used when starting a new session"""
+@router.route("/api/sequences/session", methods=["PUT"])
+def update_session_sequence():
     data = request.json
+    required_fields = ["user_id", "title", "target_role", "target_industry", "sequence_data"]
+    
     session_id = data.get("session_id")
     
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"error": f"{field} is required"}), 400
+    
+    db = SessionLocal()
+    try:
+        existing_sequence = db.query(Sequence).filter(
+            Sequence.session_id == session_id
+        ).first()
+        
+        if not existing_sequence:
+            return jsonify({"error": "Sequence not found"}), 404
+        
+        if "title" in data:
+            existing_sequence.title = data["title"]
+        if "target_role" in data:
+            existing_sequence.target_role = data["target_role"]
+        if "target_industry" in data:
+            existing_sequence.target_industry = data["target_industry"]
+        if "sequence_data" in data:
+            existing_sequence.sequence_data = data["sequence_data"]
+        
+        existing_sequence.updated_at = datetime.now()
+        db.commit()
+        
+        if existing_sequence.session_id and existing_sequence.sequence_data:
+            emit_sequence_update(existing_sequence.session_id, existing_sequence.sequence_data)
+        
+        return jsonify({
+            "id": existing_sequence.id,
+            "message": "Sequence updated successfully"
+        })
+    finally:
+        db.close()
+
+@router.route("/api/sequences/session", methods=["DELETE"])
+def delete_session_sequence():
+    session_id = request.args.get("session_id")
+    
     logger = logging.getLogger(__name__)
-    logger.info(f"POST /api/sequences/reset - session_id: {session_id}")
+    logger.info(f"DELETE /api/sequences/session - session_id: {session_id}")
     
     if not session_id:
-        logger.warning("No session_id provided in reset request")
+        logger.warning("No session_id provided in request")
         return jsonify({"error": "session_id is required"}), 400
     
-    # This endpoint doesn't actually delete anything from the database
-    # It just serves as a trigger for WebSocket notifications to clear UI state
-    
-    # If using WebSockets, emit an event to clear sequence data
+    db = SessionLocal()
     try:
-        logger.info(f"Attempting to reset sequence data for session: {session_id}")
-        from api.websocket import emit_sequence_update, socketio
+        sequence = db.query(Sequence).filter(
+            Sequence.session_id == session_id
+        ).first()
         
-        # Use the dedicated function for reliable updates
-        success = emit_sequence_update(session_id, None)
+        if not sequence:
+            return jsonify({"error": "Sequence not found"}), 404
         
-        if success:
-            logger.info(f"Successfully reset sequence data for session: {session_id}")
-            return jsonify({"status": "success", "message": "Sequence data reset"}), 200
-        else:
-            logger.warning(f"Failed to reset sequence data for session: {session_id}")
-            return jsonify({"status": "warning", "message": "Sequence data reset may not have reached all clients"}), 200
-            
-    except ImportError as e:
-        logger.error(f"WebSockets not available: {str(e)}")
-        # WebSockets not available, still return success
-        return jsonify({"status": "success", "message": "Sequence data reset (no WebSocket)"}), 200
+        db.delete(sequence)
+        db.commit()
+        
+        emit_sequence_update(session_id, None)
+        
+        return jsonify({
+            "message": "Sequence deleted successfully"
+        })
     except Exception as e:
-        logger.error(f"Error resetting sequence data: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500 
+        logger.error(f"Error deleting sequence: {str(e)}", exc_info=True)
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    finally:
+        db.close() 

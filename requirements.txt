@@ -13,3 +13,4 @@ python-dotenv==1.0.0
 openai==1.69.0
 psycopg2-binary==2.9.9
 eventlet==0.35.2
+ruff==0.6.2

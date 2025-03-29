@@ -1,17 +1,21 @@
 import { useState } from 'react';
 
 interface SequenceStepProps {
+  index: number;
   step: number;
+  day: number;
   channel: string;
   timing: string;
   subject?: string;
   message: string;
   onEdit: (index: number, field: string, value: string) => void;
-  onRemove: () => void;
+  onRemove: (index: number) => void;
 }
 
 export default function SequenceStep({
+  index,
   step,
+  day,
   channel,
   timing,
   subject,
@@ -22,7 +26,7 @@ export default function SequenceStep({
   const [isExpanded, setIsExpanded] = useState(false);
 
   const handleChange = (field: string, value: string) => {
-    onEdit(0, field, value);
+    onEdit(index, field, value);
   };
 
   return (
@@ -62,7 +66,7 @@ export default function SequenceStep({
             className="text-red-500 hover:text-red-700"
             onClick={(e) => {
               e.stopPropagation();
-              onRemove();
+              onRemove(index);
             }}
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
@@ -97,6 +101,7 @@ export default function SequenceStep({
               </label>
               <input
                 type="number"
+                value={day}
                 onChange={(e) => handleChange('day', e.target.value)}
                 className="w-full border rounded-md p-2"
                 min="0"

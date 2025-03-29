@@ -8,7 +8,8 @@
     "dev": "concurrently \"bun run dev:next\" \"bun run dev:flask\"",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint && ruff check api",
+    "lint:fix": "next lint --fix && ruff check --fix api"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.1.2",

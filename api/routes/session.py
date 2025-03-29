@@ -4,14 +4,14 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from api.db import SessionLocal
-from api.models import Sequence, Session
+from api.models import Message, Sequence, Session
 
 session_routes = Blueprint("session", __name__)
 logger = logging.getLogger(__name__)
 
 @session_routes.route("/api/sessions", methods=["GET"])
 def get_sessions():
-    """Get all sessions for a user"""
+    
     user_id = request.args.get("user_id")
     
     if not user_id:
@@ -22,8 +22,7 @@ def get_sessions():
         sessions = db.query(Session).filter(
             Session.user_id == user_id
         ).order_by(Session.created_at.desc()).all()
-        
-        # Convert to dictionary format for client
+
         session_data = [
             {
                 "id": session.id,
@@ -40,7 +39,7 @@ def get_sessions():
 
 @session_routes.route("/api/sessions/<session_id>", methods=["GET"])
 def get_session(session_id):
-    """Get a specific session by ID"""
+    
     db = SessionLocal()
     try:
         session = db.query(Session).filter(
@@ -49,8 +48,7 @@ def get_session(session_id):
         
         if not session:
             return jsonify({"error": "Session not found"}), 404
-        
-        # Get sequences linked to this session
+
         sequences = db.query(Sequence).filter(
             Sequence.session_id == session_id
         ).all()
@@ -65,8 +63,7 @@ def get_session(session_id):
             }
             for seq in sequences
         ]
-        
-        # Convert to dictionary format for client
+
         session_data = {
             "id": session.id,
             "name": session.name,
@@ -81,7 +78,7 @@ def get_session(session_id):
 
 @session_routes.route("/api/sessions", methods=["POST"])
 def create_session():
-    """Create a new session"""
+    
     data = request.json
     session_id = data.get("session_id")
     user_id = data.get("user_id")
@@ -92,12 +89,11 @@ def create_session():
     
     db = SessionLocal()
     try:
-        # Check if session already exists
+
         existing = db.query(Session).filter(Session.id == session_id).first()
         if existing:
             return jsonify({"error": "Session ID already exists", "id": session_id}), 400
-        
-        # Create new session
+
         new_session = Session(
             id=session_id,
             name=name,
@@ -124,37 +120,106 @@ def create_session():
 
 @session_routes.route("/api/sessions/<session_id>", methods=["PUT"])
 def update_session(session_id):
-    """Update a session (rename)"""
-    data = request.json
-    name = data.get("name")
     
-    if not name:
+    data = request.json
+    if not data or "name" not in data:
         return jsonify({"error": "name is required"}), 400
     
     db = SessionLocal()
     try:
-        session = db.query(Session).filter(
-            Session.id == session_id
-        ).first()
+        session = db.query(Session).filter(Session.id == session_id).first()
         
         if not session:
             return jsonify({"error": "Session not found"}), 404
-        
-        # Update name
-        session.name = name
+
+        session.name = data["name"]
         session.updated_at = datetime.now()
         db.commit()
         
-        logger.info(f"Renamed session {session_id} to '{name}'")
+        logger.info(f"Updated session {session_id} name to {data['name']}")
         
         return jsonify({
             "id": session.id,
             "name": session.name,
-            "updated_at": session.updated_at.isoformat(),
-            "message": "Session updated successfully"
+            "updated_at": session.updated_at.isoformat()
         })
     except Exception as e:
-        logger.error(f"Error updating session: {str(e)}")
+        db.rollback()
+        logger.error(f"Error updating session: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@session_routes.route("/api/sessions/<session_id>", methods=["DELETE"])
+def delete_session(session_id):
+    
+    db = SessionLocal()
+    try:
+
+        session = db.query(Session).filter(Session.id == session_id).first()
+        
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        db.query(Message).filter(Message.session_id == session_id).delete()
+        db.query(Sequence).filter(Sequence.session_id == session_id).delete()
+
+        db.delete(session)
+        db.commit()
+        
+        logger.info(f"Deleted session {session_id}")
+        
+        return jsonify({"message": "Session deleted successfully"})
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting session: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@session_routes.route("/api/sessions/fix-names", methods=["POST"])
+def fix_empty_session_names():
+    
+    db = SessionLocal()
+    try:
+
+        empty_name_sessions = db.query(Session).filter(
+            (Session.name == "") | (Session.name is None)
+        ).all()
+        
+        fixed_count = 0
+
+        for session in empty_name_sessions:
+
+            first_message = db.query(Message).filter(
+                Message.session_id == session.id,
+                Message.role == "user"
+            ).order_by(Message.created_at).first()
+            
+            if first_message:
+
+                content = first_message.content
+                truncated_content = content[:30].strip()
+                new_name = truncated_content + ("..." if len(content) > 30 else "")
+
+                session.name = new_name
+                session.updated_at = datetime.now()
+                fixed_count += 1
+            else:
+
+                session.name = f"Session {session.created_at.strftime('%Y-%m-%d')}"
+                session.updated_at = datetime.now()
+                fixed_count += 1
+
+        db.commit()
+        
+        return jsonify({
+            "message": f"Fixed {fixed_count} sessions with empty names",
+            "fixed_count": fixed_count
+        })
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error fixing session names: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
         db.close() 

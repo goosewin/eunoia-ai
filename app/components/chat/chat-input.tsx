@@ -1,5 +1,5 @@
 import { FormEvent, useState } from 'react';
-import Button from '../UI/Button';
+import { Button } from '../ui/button';
 
 interface ChatInputProps {
   onSendMessage: (message: string) => void;

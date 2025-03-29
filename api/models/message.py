@@ -1,4 +1,3 @@
-from datetime import datetime
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -14,9 +13,10 @@ class Message(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String(50), ForeignKey("sessions.id"), index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    role = Column(String(10))  # 'user' or 'assistant'
+    role = Column(String(15))
     content = Column(Text)
     tool_calls = Column(JSONB, nullable=True)
+    tool_call_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     user = relationship("User", back_populates="messages")

@@ -1,13 +1,13 @@
 "use client"
 
-import { EunoiaAI } from "@/app/components/eunoia-ai"
-import { AgentProvider } from "@/app/contexts/AgentContext"
+import { AppWrapper } from "@/app/components/app-wrapper"
+import { AgentProvider } from "@/app/contexts/agent-context"
 
 export default function Home() {
   return (
     <main className="min-h-screen bg-[hsl(var(--color-gray-light))]">
       <AgentProvider>
-        <EunoiaAI />
+        <AppWrapper />
       </AgentProvider>
     </main>
   )

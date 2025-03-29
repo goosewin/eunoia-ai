@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify, request
 
-from api.db import SessionLocal, get_db
+from api.db import SessionLocal
 from api.models import User
 
 user_routes = Blueprint("user", __name__)
@@ -18,8 +18,7 @@ def get_user():
         
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Convert to dictionary format for client
+
         user_data = {
             "id": user.id,
             "name": user.name,
@@ -37,19 +36,18 @@ def get_user():
 def create_or_update_user():
     data = request.json
     required_fields = ["name", "email"]
-    
-    # Validate required fields
+
     for field in required_fields:
         if field not in data:
             return jsonify({"error": f"{field} is required"}), 400
     
     db = SessionLocal()
     try:
-        # Check if user exists by email
+
         existing_user = db.query(User).filter(User.email == data["email"]).first()
         
         if existing_user:
-            # Update existing user
+
             if "name" in data:
                 existing_user.name = data["name"]
             if "company" in data:
@@ -71,7 +69,7 @@ def create_or_update_user():
             
             return jsonify(user_data)
         else:
-            # Create new user
+
             new_user = User(
                 name=data["name"],
                 email=data["email"],
