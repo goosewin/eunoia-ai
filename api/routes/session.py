@@ -155,15 +155,13 @@ def delete_session(session_id):
     
     db = SessionLocal()
     try:
-
         session = db.query(Session).filter(Session.id == session_id).first()
         
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
-        db.query(Message).filter(Message.session_id == session_id).delete()
-        db.query(Sequence).filter(Sequence.session_id == session_id).delete()
-
+        # With cascade relationships set up, we only need to delete the session
+        # and related messages and sequences will be automatically deleted
         db.delete(session)
         db.commit()
         

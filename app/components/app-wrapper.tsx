@@ -277,6 +277,27 @@ export function AppWrapper() {
     }
   }, [messages, usingTool]);
 
+  // Listen for welcome message events
+  useEffect(() => {
+    const handleWelcomeMessage = (event: CustomEvent) => {
+      if (event.detail && event.detail.message) {
+        // Only set welcome message if no messages exist
+        setMessages(prevMessages => {
+          if (prevMessages.length === 0) {
+            return [{ type: 'system', text: event.detail.message }];
+          }
+          return prevMessages;
+        });
+      }
+    };
+
+    window.addEventListener('welcome_message', handleWelcomeMessage as EventListener);
+
+    return () => {
+      window.removeEventListener('welcome_message', handleWelcomeMessage as EventListener);
+    };
+  }, []);
+
   return (
     <div className="w-full">
       {sidebarOpen && (

@@ -63,39 +63,54 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
 
     const initializeSession = async () => {
       try {
+        // Get sessions from localStorage first
+        const storedSessions = localStorage.getItem('sessions');
+        let localSessionsData: Session[] = [];
 
-        const response = await fetch(`/api/sessions?user_id=${userId}`);
-        let sessionsData: Session[] = [];
-
-        if (response.ok) {
-          const data = await response.json();
-          if (Array.isArray(data)) {
-            sessionsData = data;
-            setSessions(data);
-            localStorage.setItem('sessions', JSON.stringify(data));
-          }
-        } else {
-
-          const storedSessions = localStorage.getItem('sessions');
-          if (storedSessions) {
-            try {
-              sessionsData = JSON.parse(storedSessions);
-              setSessions(sessionsData);
-            } catch (e) {
-              console.error('Error parsing stored sessions:', e);
-            }
+        if (storedSessions) {
+          try {
+            localSessionsData = JSON.parse(storedSessions);
+          } catch (e) {
+            console.error('Error parsing stored sessions:', e);
           }
         }
 
+        // Fetch from server
+        const response = await fetch(`/api/sessions?user_id=${userId}`);
+        let finalSessions: Session[] = localSessionsData;
+
+        if (response.ok) {
+          const serverSessionsData = await response.json();
+
+          if (Array.isArray(serverSessionsData)) {
+            if (storedSessions) {
+              // If we have local sessions, only keep server sessions that also exist locally
+              // This ensures sessions deleted from localStorage remain deleted
+              const localSessionIds = new Set(localSessionsData.map(s => s.id));
+              finalSessions = serverSessionsData.filter(s => localSessionIds.has(s.id));
+            } else {
+              // If no localStorage data yet, use server data
+              finalSessions = serverSessionsData;
+            }
+
+            setSessions(finalSessions);
+            localStorage.setItem('sessions', JSON.stringify(finalSessions));
+          }
+        } else {
+          // If server request fails, use local data
+          finalSessions = localSessionsData;
+          setSessions(localSessionsData);
+        }
+
         if (storedSessionId) {
-          const sessionExists = sessionsData.some(s => s.id === storedSessionId);
+          // Check if stored session exists in our final list
+          const sessionExists = finalSessions.some(s => s.id === storedSessionId);
 
           if (sessionExists) {
-
             setSessionId(storedSessionId);
             console.log('Using existing session ID:', storedSessionId);
 
-            const currentSession = sessionsData.find(s => s.id === storedSessionId);
+            const currentSession = finalSessions.find(s => s.id === storedSessionId);
             if (currentSession) {
               setCurrentSessionName(currentSession.name);
             }
@@ -104,12 +119,10 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
             createNewSessionInternal(userId);
           }
         } else {
-
           createNewSessionInternal(userId);
         }
       } catch (error) {
         console.error('Error initializing session:', error);
-
         createNewSessionInternal(userId);
       }
     };
@@ -151,6 +164,22 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         .then((data) => console.log('New session created on server:', data))
         .catch((error) => {
           console.error('Error creating new session:', error);
+        });
+
+      // Fetch welcome message when creating initial session
+      fetch('/api/config')
+        .then(response => response.json())
+        .then(data => {
+          if (data.welcome_message) {
+            if (window && window.dispatchEvent) {
+              window.dispatchEvent(new CustomEvent('welcome_message', {
+                detail: { message: data.welcome_message }
+              }));
+            }
+          }
+        })
+        .catch(error => {
+          console.error('Error fetching welcome message:', error);
         });
 
       setTimeout(() => {
@@ -220,6 +249,23 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       .then((data) => console.log('New session created on server:', data))
       .catch((error) => {
         console.error('Error creating new session:', error);
+      });
+
+    // Fetch welcome message configuration
+    fetch('/api/config')
+      .then(response => response.json())
+      .then(data => {
+        if (data.welcome_message) {
+          // Emit a welcome message to display in the UI
+          if (window && window.dispatchEvent) {
+            window.dispatchEvent(new CustomEvent('welcome_message', {
+              detail: { message: data.welcome_message }
+            }));
+          }
+        }
+      })
+      .catch(error => {
+        console.error('Error fetching welcome message:', error);
       });
 
     console.log('Resetting sequence data for new session:', newSessionId);
@@ -300,8 +346,6 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     if (currentSession) {
       setCurrentSessionName(currentSession.name);
     }
-
-    console.log('Switched to session ID:', sid);
   };
 
   const renameSession = (sid: string, name: string) => {
@@ -398,16 +442,15 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         return response.json();
       })
       .then(() => {
+        const updatedSessions = sessions.filter(s => s.id !== sid);
+        setSessions(updatedSessions);
 
-        setSessions(prev => prev.filter(s => s.id !== sid));
+        localStorage.setItem('sessions', JSON.stringify(updatedSessions));
 
         if (sid === sessionId) {
-          const remainingSessions = sessions.filter(s => s.id !== sid);
-          if (remainingSessions.length > 0) {
-
-            switchSession(remainingSessions[0].id);
+          if (updatedSessions.length > 0) {
+            switchSession(updatedSessions[0].id);
           } else {
-
             createNewSession();
           }
         }
@@ -415,7 +458,10 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       .catch(error => {
         console.error('Error deleting session:', error);
 
-        setSessions(prev => prev.filter(s => s.id !== sid));
+        const updatedSessions = sessions.filter(s => s.id !== sid);
+        setSessions(updatedSessions);
+
+        localStorage.setItem('sessions', JSON.stringify(updatedSessions));
       })
       .finally(() => {
         setIsDeletingSession(false);
